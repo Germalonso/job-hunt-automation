@@ -1,0 +1,19 @@
+# Segredos — nunca versionar
+.env
+*.env
+!.env.example
+
+# Exports crus do n8n: o export do workflow grava headers e credenciais em
+# texto puro. Só versionar a versão sanitizada em n8n/radar-vagas.json
+n8n/exports/
+n8n/*-raw.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Sistema
+.DS_Store
+Thumbs.db
