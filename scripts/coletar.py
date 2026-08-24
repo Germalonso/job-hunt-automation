@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # O stdout do Windows e cp1252 e estoura UnicodeEncodeError em titulo com emoji
 # (7 em cada 253 vagas medidas). Precisa vir antes de qualquer print.
@@ -47,6 +50,109 @@ EXCLUIR = ("suporte", "aprendiz", "contabilidade", "vendas", "comercial",
 
 IDADE_MAXIMA = timedelta(hours=72)
 INTERNSHIP = "vacancy_type_internship"
+
+# Teto de notificacao por ciclo. Mensagem gigante no WhatsApp e ilegivel, e
+# 30 vagas de uma vez significa que algo quebrou no filtro, nao que o dia foi bom.
+VAGAS_POR_MENSAGEM = 10
+MAX_MENSAGENS = 3
+
+
+def carregar_env(caminho=None):
+    """Le o .env sem dependencia externa. Nao sobrescreve variavel ja no ambiente."""
+    arquivo = Path(caminho) if caminho else Path(__file__).resolve().parent.parent / ".env"
+    if not arquivo.exists():
+        return {}
+    valores = {}
+    for linha in arquivo.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith("#") or "=" not in linha:
+            continue
+        chave, _, valor = linha.partition("=")
+        valores[chave.strip()] = valor.strip().strip('"').strip("'")
+    for chave, valor in valores.items():
+        os.environ.setdefault(chave, valor)
+    return valores
+
+
+def config_evolution():
+    """Devolve (url, instancia, apikey, destino) ou levanta RuntimeError explicando."""
+    carregar_env()
+    url = os.environ.get("EVOLUTION_URL", "http://localhost:8080").rstrip("/")
+    instancia = os.environ.get("EVOLUTION_INSTANCIA", "")
+    apikey = os.environ.get("EVOLUTION_APIKEY", "")
+    destino = re.sub(r"\D", "", os.environ.get("WHATSAPP_DESTINO", ""))
+
+    faltando = [nome for nome, valor in
+                (("EVOLUTION_INSTANCIA", instancia), ("EVOLUTION_APIKEY", apikey),
+                 ("WHATSAPP_DESTINO", destino)) if not valor]
+    if faltando:
+        raise RuntimeError("faltando no .env: " + ", ".join(faltando)
+                           + "  (copie de .env.example)")
+    if not (12 <= len(destino) <= 13):
+        raise RuntimeError("WHATSAPP_DESTINO deve ter 12 ou 13 digitos no formato "
+                           "55DDDNNNNNNNNN; veio com " + str(len(destino)))
+    return url, instancia, apikey, destino
+
+
+def enviar_whatsapp(texto, tentativas=3):
+    """POST na Evolution v2: body {number, text}. A v1 usava textMessage aninhado."""
+    url, instancia, apikey, destino = config_evolution()
+    # A instancia vai na URL e pode conter espaco — precisa de escape.
+    endpoint = url + "/message/sendText/" + urllib.parse.quote(instancia, safe="")
+    corpo = json.dumps({"number": destino, "text": texto}).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint, data=corpo, method="POST",
+        headers={"Content-Type": "application/json", "apikey": apikey})
+
+    for tentativa in range(1, tentativas + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as erro:
+            detalhe = erro.read().decode("utf-8", "replace")[:300]
+            # 4xx nao melhora com retry: chave errada ou instancia desconectada.
+            if 400 <= erro.code < 500:
+                raise RuntimeError("Evolution HTTP " + str(erro.code) + ": " + detalhe)
+            if tentativa == tentativas:
+                raise RuntimeError("Evolution HTTP " + str(erro.code) + ": " + detalhe)
+        except (urllib.error.URLError, TimeoutError) as erro:
+            if tentativa == tentativas:
+                raise RuntimeError("Evolution inacessivel: " + str(erro))
+        time.sleep(2 * tentativa)
+
+
+def formatar_mensagem(vagas):
+    """Monta o texto de uma mensagem. Sem markdown pesado: o WhatsApp so faz *negrito*."""
+    linhas = ["*" + str(len(vagas)) + " vaga(s) nova(s)*", ""]
+    for vaga in vagas:
+        local = vaga["workplace_type"] or "?"
+        if vaga["cidade"]:
+            local += " · " + vaga["cidade"]
+        linhas.append("*" + str(vaga["titulo"]) + "*")
+        linhas.append(str(vaga["empresa"]) + " · " + local
+                      + " · ha " + idade_legivel(vaga["idade"]))
+        if vaga["prazo"]:
+            linhas.append("prazo: " + str(vaga["prazo"]))
+        linhas.append(str(vaga["url"]))
+        linhas.append("")
+    return "\n".join(linhas).strip()
+
+
+def notificar(vagas):
+    """Fatia em mensagens e envia. Devolve quantas vagas foram efetivamente enviadas."""
+    if not vagas:
+        return 0
+    lotes = [vagas[i:i + VAGAS_POR_MENSAGEM]
+             for i in range(0, len(vagas), VAGAS_POR_MENSAGEM)][:MAX_MENSAGENS]
+    enviadas = 0
+    for indice, lote in enumerate(lotes, start=1):
+        enviar_whatsapp(formatar_mensagem(lote))
+        enviadas += len(lote)
+        print("  enviada mensagem " + str(indice) + "/" + str(len(lotes))
+              + " com " + str(len(lote)) + " vaga(s)")
+        if indice < len(lotes):
+            time.sleep(2)
+    return enviadas
 
 
 def normalizar(s):
@@ -214,16 +320,54 @@ def main():
     parser = argparse.ArgumentParser(description="Radar de Vagas — coletor da Gupy")
     parser.add_argument("--dry-run", action="store_true",
                         help="coleta e imprime no terminal, sem gravar nem notificar")
+    parser.add_argument("--notify", action="store_true",
+                        help="coleta e envia as vagas aprovadas no WhatsApp")
+    parser.add_argument("--test-notify", action="store_true",
+                        help="envia uma mensagem sintetica para validar a entrega")
     args = parser.parse_args()
 
-    if not args.dry_run:
+    if args.test_notify:
+        carimbo = datetime.now().strftime("%d/%m %H:%M")
+        try:
+            enviar_whatsapp("*radar online* · teste de entrega " + carimbo
+                            + "\nSe voce esta lendo isto, a Evolution esta entregando.")
+        except RuntimeError as erro:
+            print("FALHOU: " + str(erro), file=sys.stderr)
+            return 1
+        print("mensagem de teste enviada.")
+        return 0
+
+    if not (args.dry_run or args.notify):
         parser.print_help()
-        print("\nEtapa 0: apenas --dry-run esta implementado.", file=sys.stderr)
+        print("\nEscolha um modo: --dry-run, --notify ou --test-notify.",
+              file=sys.stderr)
         return 2
 
-    print("Radar de Vagas — coleta (dry-run)\n")
+    modo = "notify" if args.notify else "dry-run"
+    print("Radar de Vagas — coleta (" + modo + ")\n")
+
+    # Validar credencial ANTES de gastar 4 requests na Gupy.
+    if args.notify:
+        try:
+            config_evolution()
+        except RuntimeError as erro:
+            print("FALHOU: " + str(erro), file=sys.stderr)
+            return 1
+
     vagas, total, rejeicoes = coletar(verboso=True)
     imprimir(vagas, total, rejeicoes)
+
+    if args.notify:
+        if not vagas:
+            print("nada a notificar.")
+            return 0
+        print()
+        try:
+            enviadas = notificar(vagas)
+        except RuntimeError as erro:
+            print("FALHOU no envio: " + str(erro), file=sys.stderr)
+            return 1
+        print(str(enviadas) + " vaga(s) notificada(s).")
     return 0
 
 

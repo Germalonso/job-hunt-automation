@@ -102,7 +102,7 @@ pré-requisitos verificados e a definição de pronto.
 
 ```
 [x] Etapa 0 — coleta e exibição no terminal
-[ ] Etapa 1 — entrega no WhatsApp
+[x] Etapa 1 — entrega no WhatsApp
 [ ] Etapa 2 — persistência e deduplicação
 [ ] Etapa 3 — orquestração autônoma no n8n
 ```
