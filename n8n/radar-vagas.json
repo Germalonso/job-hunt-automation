@@ -1,0 +1,358 @@
+{
+  "name": "Radar de Vagas",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "7,37 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "agenda-30min",
+      "name": "Agenda 30min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT querystring FROM perfis_busca WHERE ativo ORDER BY querystring;",
+        "options": {}
+      },
+      "id": "perfis-ativos",
+      "name": "Perfis ativos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RADAR_PG",
+          "name": "Postgres - job_hunt_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "loop-perfis",
+      "name": "Loop perfis",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://employability-portal.gupy.io/api/v1/jobs?{{ $json.querystring }}&offset=0&limit=100",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "radar-vagas/1.0 (github.com/Germalonso/job-hunt-automation)"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      },
+      "id": "busca-gupy",
+      "name": "Busca Gupy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        140
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Espelha scripts/coletar.py. Filtro aplicado SO em `name`: em `description`\n// a medicao deu 47% de falso positivo em \"dados\" e 30% de falso negativo em\n// \"suporte\".\nconst norm = (s) => (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase();\n\nconst NIVEL = ['estagio', 'estagiario', 'estagiaria', 'junior', 'jr', 'trainee'];\nconst AREA = ['desenvolvedor', 'desenvolvimento', 'software', 'backend', 'frontend',\n  'fullstack', 'dados', 'data', 'python', 'java', 'javascript', 'automacao',\n  'cloud', 'aws', 'engenheiro'];\nconst EXCLUIR = ['suporte', 'aprendiz', 'contabilidade', 'vendas', 'comercial',\n  'telemarketing'];\n\n// Fronteira de palavra: sem isso 'jr' casa dentro de outra palavra.\nconst bate = (titulo, termos) => termos.filter((t) => new RegExp('\\\\b' + t + '\\\\b').test(titulo));\n\nconst agora = Date.now();\nconst MAX_IDADE = 72 * 3600 * 1000;\nconst hoje = new Date().toISOString().slice(0, 10);\nconst saida = [];\n\nfor (const item of $input.all()) {\n  const vagas = (item.json && item.json.data) || [];\n  for (const v of vagas) {\n    const titulo = norm(v.name);\n\n    // Exclusao tem precedencia sobre area.\n    if (bate(titulo, EXCLUIR).length > 0) continue;\n\n    const ehEstagio = v.type === 'vacancy_type_internship';\n    // Para internship o proprio type ja provou o nivel.\n    if (!ehEstagio && bate(titulo, NIVEL).length === 0) continue;\n\n    const areas = bate(titulo, AREA);\n    if (areas.length === 0) continue;\n\n    // publishedDate vem em dois formatos; sem o Z o JS assume horario local.\n    let iso = v.publishedDate;\n    if (!iso) continue;\n    if (/^\\d{4}-\\d{2}-\\d{2}$/.test(iso)) iso = iso + 'T00:00:00Z';\n    const publicada = Date.parse(iso);\n    if (!publicada) continue;\n    const idade = agora - publicada;\n    if (idade > MAX_IDADE) continue;\n\n    const prazo = v.applicationDeadline || '';\n    if (prazo && prazo < hoje) continue;\n\n    const remoto = Boolean(v.isRemoteWork) || v.workplaceType === 'remote';\n    let score = 0;\n    const motivos = [];\n    if (remoto) { score += 40; motivos.push('remoto'); }\n    if (ehEstagio) { score += 30; motivos.push('internship'); }\n    score += 20; motivos.push(areas[0]);\n    if (idade < 6 * 3600 * 1000) { score += 10; motivos.push('recente'); }\n\n    saida.push({ json: {\n      id_externo: String(v.id),\n      titulo: String(v.name || '').trim(),\n      empresa: v.careerPageName || '',\n      url: v.jobUrl || '',\n      tipo: v.type || '',\n      workplace_type: v.workplaceType || '',\n      cidade: v.city || '',\n      remoto: remoto,\n      publicada_em: new Date(publicada).toISOString(),\n      prazo: prazo,\n      score: score,\n      motivo: motivos.join('; '),\n    } });\n  }\n}\n\nreturn saida;\n"
+      },
+      "id": "filtrar-e-pontuar",
+      "name": "Filtrar e pontuar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        140
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO vagas (fonte, id_externo, titulo, empresa, url, tipo, workplace_type, cidade, remoto, publicada_em, prazo, score, motivo)\nSELECT 'gupy', $1, $2, NULLIF($3,''), NULLIF($4,''), NULLIF($5,''), NULLIF($6,''), NULLIF($7,''),\n       NULLIF($8,'')::boolean, NULLIF($9,'')::timestamptz, NULLIF($10,'')::date, NULLIF($11,'')::int, NULLIF($12,'')\n-- O WHERE deixa o no rodar sem gravar quando o ciclo nao achou vaga,\n-- para o Loop Over Items nao travar num batch vazio.\nWHERE NULLIF($1,'') IS NOT NULL AND NULLIF($2,'') IS NOT NULL\nON CONFLICT (fonte, id_externo) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ [$json.id_externo || '', $json.titulo || '', $json.empresa || '', $json.url || '', $json.tipo || '', $json.workplace_type || '', $json.cidade || '', $json.remoto === undefined ? '' : String($json.remoto), $json.publicada_em || '', $json.prazo || '', $json.score === undefined ? '' : String($json.score), $json.motivo || ''] }}"
+        }
+      },
+      "id": "gravar-vagas",
+      "name": "Gravar vagas",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        900,
+        140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RADAR_PG",
+          "name": "Postgres - job_hunt_db"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "seconds"
+      },
+      "id": "pausa-2s",
+      "name": "Pausa 2s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        140
+      ],
+      "webhookId": "radar-wait-1"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT v.fonte, v.id_externo, v.titulo, v.empresa, v.url, v.workplace_type,\n       v.cidade, v.publicada_em, v.prazo, v.score,\n       (SELECT valor FROM config WHERE chave = 'whatsapp_destino') AS destino\nFROM vagas v\nWHERE v.notificada_em IS NULL\n  AND v.publicada_em > now() - interval '72 hours'\nORDER BY v.score DESC, v.publicada_em DESC\nLIMIT 10;",
+        "options": {}
+      },
+      "id": "pendentes",
+      "name": "Pendentes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        460,
+        -140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RADAR_PG",
+          "name": "Postgres - job_hunt_db"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Monta uma mensagem so, e a lista de ids que sera carimbada depois do envio.\nconst itens = $input.all().filter((i) => i.json && i.json.id_externo);\nif (itens.length === 0) return [];\n\nconst destino = itens[0].json.destino || '';\nif (!destino) {\n  throw new Error('config.whatsapp_destino nao definido. Rode o INSERT documentado em db/01-schema.sql');\n}\n\nconst linhas = ['*' + itens.length + ' vaga(s) nova(s)*', ''];\nfor (const item of itens) {\n  const v = item.json;\n  let local = v.workplace_type || '?';\n  if (v.cidade) local = local + ' \\u00b7 ' + v.cidade;\n  // O WhatsApp so fecha o negrito com o * colado a caractere nao-branco.\n  const titulo = String(v.titulo || '').trim();\n  linhas.push(titulo ? '*' + titulo + '*' : '(sem titulo)');\n  linhas.push((v.empresa || '') + ' \\u00b7 ' + local);\n  if (v.prazo) linhas.push('prazo: ' + String(v.prazo).slice(0, 10));\n  linhas.push(v.url || '');\n  linhas.push('');\n}\n\nreturn [{ json: {\n  destino: destino,\n  texto: linhas.join('\\n').trim(),\n  ids: itens.map((i) => i.json.id_externo).join(','),\n} }];\n"
+      },
+      "id": "montar-mensagem",
+      "name": "Montar mensagem",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://evolution-api:8080/message/sendText/radar",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ number: $json.destino, text: $json.texto }) }}",
+        "options": {}
+      },
+      "id": "enviar-whatsapp",
+      "name": "Enviar WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        -140
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "RADAR_EVO",
+          "name": "Evolution apikey"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- O WHERE e obrigatorio: sem ele o UPDATE carimba a tabela inteira.\nUPDATE vagas SET notificada_em = now(), status = 'notificada'\nWHERE fonte = 'gupy' AND id_externo = ANY(string_to_array($1, ','));",
+        "options": {
+          "queryReplacement": "={{ $('Montar mensagem').item.json.ids }}"
+        }
+      },
+      "id": "marcar-notificadas",
+      "name": "Marcar notificadas",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1120,
+        -140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RADAR_PG",
+          "name": "Postgres - job_hunt_db"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Agenda 30min": {
+      "main": [
+        [
+          {
+            "node": "Perfis ativos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Perfis ativos": {
+      "main": [
+        [
+          {
+            "node": "Loop perfis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop perfis": {
+      "main": [
+        [
+          {
+            "node": "Pendentes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Busca Gupy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Busca Gupy": {
+      "main": [
+        [
+          {
+            "node": "Filtrar e pontuar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filtrar e pontuar": {
+      "main": [
+        [
+          {
+            "node": "Gravar vagas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gravar vagas": {
+      "main": [
+        [
+          {
+            "node": "Pausa 2s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pausa 2s": {
+      "main": [
+        [
+          {
+            "node": "Loop perfis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pendentes": {
+      "main": [
+        [
+          {
+            "node": "Montar mensagem",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar mensagem": {
+      "main": [
+        [
+          {
+            "node": "Enviar WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Marcar notificadas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Sao_Paulo"
+  }
+}

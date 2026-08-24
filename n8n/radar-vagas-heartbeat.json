@@ -1,0 +1,101 @@
+{
+  "name": "Radar de Vagas - Heartbeat",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "todo-dia-8h",
+      "name": "Todo dia 8h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT (SELECT valor FROM config WHERE chave = 'whatsapp_destino') AS destino,\n       (SELECT count(*) FROM vagas WHERE criada_em > now() - interval '24 hours') AS coletadas,\n       (SELECT count(*) FROM vagas WHERE notificada_em > now() - interval '24 hours') AS notificadas;",
+        "options": {}
+      },
+      "id": "contagem-24h",
+      "name": "Contagem 24h",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RADAR_PG",
+          "name": "Postgres - job_hunt_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://evolution-api:8080/message/sendText/radar",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ number: $json.destino, text: '*radar vivo* \\u00b7 ' + $json.coletadas + ' coletadas, ' + $json.notificadas + ' notificadas em 24h' }) }}",
+        "options": {}
+      },
+      "id": "enviar-heartbeat",
+      "name": "Enviar heartbeat",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "RADAR_EVO",
+          "name": "Evolution apikey"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Todo dia 8h": {
+      "main": [
+        [
+          {
+            "node": "Contagem 24h",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contagem 24h": {
+      "main": [
+        [
+          {
+            "node": "Enviar heartbeat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Sao_Paulo"
+  }
+}

@@ -3,6 +3,10 @@
 Monitor automatizado da API pública da Gupy que notifica no WhatsApp vagas de
 estágio e júnior em TI dentro de 30 minutos da publicação.
 
+`n8n` · `PostgreSQL` · `Evolution API` · `Python 3.12` · `Docker`
+
+---
+
 ## O problema
 
 Candidatura em vaga de tecnologia é um jogo de latência, não só de aderência.
@@ -17,20 +21,30 @@ que avançaram das que não. O perfil não era o gargalo. A janela era:
 Descobrir a vaga abrindo o site significa entrar já na faixa ruim da curva. O radar
 fecha esse intervalo para 30 minutos.
 
-## Como funciona
+## Arquitetura
 
-```
-cron 7,37 * * * *
-      │
-      ├─ 4 perfis de busca (filtro server-side na própria API da Gupy)
-      ├─ filtro de nível/área/exclusão aplicado só no título, normalizado NFD
-      ├─ corte de idade: publicada nas últimas 72h
-      ├─ dedup em Postgres por (fonte, id_externo)
-      └─ notificação via WhatsApp (Evolution API)
+```mermaid
+flowchart LR
+    A["Schedule<br/>7,37 * * * *"] --> B[("perfis_busca")]
+    B --> C{"Loop<br/>4 perfis"}
+    C -->|cada perfil| D["GET employability-portal<br/>.gupy.io"]
+    D --> E["Filtrar e pontuar<br/>NFD, só em name"]
+    E --> F[("INSERT<br/>ON CONFLICT DO NOTHING")]
+    F --> G["Wait 2s"]
+    G --> C
+    C -->|terminou| H[("SELECT pendentes<br/>notificada_em IS NULL")]
+    H --> I["Montar mensagem"]
+    I --> J["Evolution sendText"]
+    J --> K[("UPDATE notificada_em")]
 ```
 
-O estado da notificação vive em `notificada_em IS NULL`, não no INSERT. Uma falha de
-entrega no WhatsApp deixa a vaga pendente para o ciclo seguinte em vez de queimá-la.
+O estado da notificação vive em `notificada_em IS NULL`, não no `INSERT`. Uma falha
+de entrega no WhatsApp devolve a vaga ao ciclo seguinte em vez de queimá-la.
+
+Dois workflows auxiliares cobrem o que o principal não vê: um **Error Trigger** avisa
+quando o radar quebra, e um **heartbeat diário** informa quantas vagas passaram nas
+últimas 24h. Sem ele, "nenhuma vaga nova hoje" e "o radar morreu na terça" produzem
+exatamente o mesmo silêncio.
 
 ## O que eu medi antes de escrever código
 
@@ -47,9 +61,14 @@ API ao vivo derrubou a abordagem inteira:
 | Acento é opcional | `Uberlandia` → 0 resultados. `Uberlândia` → 392 | — |
 | `publishedDate` tem um formato | Dois: ISO-8601 com `Z` e data pura sem timezone | Parser força UTC quando falta timezone |
 
-O mesmo vale para o ambiente: o stdout do Windows é cp1252 e estoura
-`UnicodeEncodeError` em títulos com emoji — 7 em cada 253 vagas. O coletor força UTF-8
-no stdout.
+Dois bugs saíram de rodar de verdade, não de ler o código:
+
+**Encoding.** O stdout do Windows é cp1252 e estoura `UnicodeEncodeError` em título
+com emoji — 7 em cada 253 vagas. O coletor força UTF-8 no stdout.
+
+**Negrito vazando.** Título da Gupy às vezes termina com espaço. O WhatsApp só fecha
+o `*` quando ele está colado a um caractere não-branco, então `*título *` era exibido
+com os asteriscos crus. Apareceu no print da primeira notificação real.
 
 ## Decisões de engenharia
 
@@ -59,21 +78,63 @@ no stdout.
 **Chave primária composta `(fonte, id_externo)`.** O id da Gupy só é único dentro da
 Gupy. A composta evita colisão quando entrar uma segunda fonte.
 
-**Notificar antes de marcar.** `INSERT ... ON CONFLICT DO NOTHING`, e o `UPDATE
-notificada_em = now()` só depois da entrega confirmada.
+**`COPY` em vez de `INSERT` montado por string.** Títulos vêm com aspas, vírgulas e
+emoji direto de uma API pública. A carga vai para uma tabela temporária via CSV e daí
+para `vagas` — concatenar isso em SQL seria injeção esperando acontecer.
 
-**Heartbeat diário.** Sem ele, "nenhuma vaga nova" e "o radar morreu" produzem
-exatamente o mesmo silêncio.
+**A notificação devolve *quais* vagas saíram, não quantas.** Se a terceira mensagem
+falha, as duas primeiras seguem carimbadas e não são reenviadas no ciclo seguinte.
+
+**Paridade entre os dois caminhos.** O filtro existe em Python (`scripts/coletar.py`)
+e em JavaScript (nó Code do n8n). Sobre as mesmas 253 vagas reais, os dois aprovam as
+mesmas vagas com os mesmos scores — testado, não presumido.
 
 **Cron com jitter (`7,37`).** 192 requests/dia é volume irrelevante para um endpoint
 que o portal público chama de qualquer browser. O que chama atenção é regularidade de
-relógio, não volume — daí os minutos quebrados e o `Wait` de 2s entre perfis.
+relógio, não volume.
 
 **Segredo fora do git desde o commit inicial.** O `.gitignore` foi o primeiro arquivo
-versionado, antes de qualquer credencial existir. Credencial commitada permanece no
-histórico, e este repositório é público por design. A chave da Evolution entra no n8n
+versionado, antes de qualquer credencial existir. A chave da Evolution entra no n8n
 como credencial Header Auth, nunca como header literal — o export do workflow grava
-header literal em texto puro.
+header literal em texto puro. E o número de telefone mora numa tabela de configuração,
+não no JSON: chave se rotaciona, telefone não.
+
+## Como rodar
+
+O repositório é autocontido. O `docker-compose.yml` sobe Postgres, Redis, Evolution e
+n8n com nomes e portas próprios, escolhidos para não colidir com outros stacks na
+mesma máquina.
+
+```bash
+cp .env.example .env      # preencher RADAR_PGPASSWORD e EVOLUTION_APIKEY
+docker compose up -d
+py -3.12 scripts/coletar.py --dry-run
+```
+
+O schema é criado sozinho na primeira subida. O passo a passo completo — incluindo o
+pareamento do WhatsApp e a importação dos workflows — está em **[SETUP.md](SETUP.md)**.
+
+| Modo do coletor | Efeito |
+|---|---|
+| `--dry-run` | Coleta e imprime no terminal. Não grava, não envia |
+| `--backfill` | Grava o estoque atual já marcado como notificado, para o primeiro ciclo não disparar tudo de uma vez |
+| `--notify` | Coleta, grava, e envia no WhatsApp o que ainda não foi entregue |
+| `--test-notify` | Manda uma mensagem sintética: testa só a entrega |
+| `--test-pipeline` | Insere vaga sintética, notifica e limpa: prova o caminho banco → WhatsApp inteiro |
+
+## Estrutura
+
+```
+├── docker-compose.yml     stack autocontido (radar-*, portas 5434/8081/5679)
+├── SETUP.md               instalação numa máquina nova, do zero
+├── db/00-create-db.sql    CREATE DATABASE, idempotente via \gexec
+├── db/01-schema.sql       tabelas, índices e perfis de busca
+├── scripts/coletar.py     coletor: 5 modos, só stdlib, sem pip install
+├── n8n/radar-vagas.json            workflow principal, 11 nós
+├── n8n/radar-vagas-erro.json       Error Trigger
+├── n8n/radar-vagas-heartbeat.json  heartbeat diário
+└── docs/                  observações de filtro e evidências
+```
 
 ## Fora de escopo, e por quê
 
@@ -88,54 +149,28 @@ header literal em texto puro.
 A coluna `status` existe no schema e não é usada. Ela é o gancho da fase de CRM, e
 está documentada como tal em vez de removida.
 
-## Como rodar
+## Limites conhecidos
 
-O repositorio e autocontido: o `docker-compose.yml` sobe Postgres, Redis, Evolution
-e n8n com nomes e portas proprios, escolhidos para nao colidir com outros stacks na
-mesma maquina.
+O filtro depende de o nível aparecer no **título**. Vaga júnior anunciada como
+"Analista de Sistemas" sem qualificador é invisível para o radar — e 174 de 253 vagas
+coletadas caem fora justamente por isso, que é o comportamento desejado mas também o
+teto do método.
 
-```bash
-cp .env.example .env      # preencher RADAR_PGPASSWORD e EVOLUTION_APIKEY
-docker compose up -d
-py -3.12 scripts/coletar.py --dry-run
-```
-
-O schema e criado sozinho na primeira subida, pelo `db/` montado em
-`docker-entrypoint-initdb.d`. Os dois arquivos SQL sao separados de proposito:
-`CREATE DATABASE` e `CREATE TABLE` no mesmo script criam as tabelas no database
-errado.
-
-| Modo | Efeito |
-|---|---|
-| `--dry-run` | Coleta e imprime no terminal. Nao grava, nao envia |
-| `--backfill` | Grava o estoque atual ja marcado como notificado, para o primeiro ciclo nao disparar tudo de uma vez |
-| `--notify` | Coleta, grava, e envia no WhatsApp o que ainda nao foi entregue |
-| `--test-notify` | Manda uma mensagem sintetica: testa so a entrega |
-| `--test-pipeline` | Insere vaga sintetica, notifica e limpa: prova o caminho banco -> WhatsApp inteiro |
-
-O coletor fala com o Postgres por `docker exec`, nao por TCP, porque no ambiente
-onde ele foi construido o banco reaproveitado nao publica porta no host. O container
-alvo vem do `.env`, entao o mesmo codigo serve aos dois casos.
-
-## Stack
-
-`n8n` · `PostgreSQL 15` · `Evolution API` (WhatsApp) · `Python 3.12` · `Docker`
-
-A mesma stack que uso em produção no [recanto-karibe](https://github.com/Germalonso),
-reaproveitando os padrões de nó Postgres com `queryReplacement` e cast explícito.
+Falsos negativos observados na primeira execução estão registrados em
+[docs/observacoes-filtro.md](docs/observacoes-filtro.md) em vez de corrigidos na hora:
+ajustar o filtro no meio da construção impede saber se uma mudança de volume veio do
+filtro ou da orquestração.
 
 ## Estado
-
-Em construção. Ver [EXECUCAO.md](EXECUCAO.md) para o plano de execução, os
-pré-requisitos verificados e a definição de pronto.
 
 ```
 [x] Etapa 0 — coleta e exibição no terminal
 [x] Etapa 1 — entrega no WhatsApp
 [x] Etapa 2 — persistência e deduplicação
-[ ] Etapa 3 — orquestração autônoma no n8n
+[x] Etapa 3 — orquestração autônoma no n8n
 ```
 
 ---
 
 Alonso Moura Germano · Ciência da Computação, UFU · Uberlândia/MG
+[alonsogermano.com](https://alonsogermano.com)

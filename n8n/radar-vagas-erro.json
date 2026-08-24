@@ -1,0 +1,92 @@
+{
+  "name": "Radar de Vagas - Erro",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT valor AS destino FROM config WHERE chave = 'whatsapp_destino';",
+        "options": {}
+      },
+      "id": "destino",
+      "name": "Destino",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "RADAR_PG",
+          "name": "Postgres - job_hunt_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://evolution-api:8080/message/sendText/radar",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ number: $json.destino, text: '*RADAR CAIU*\\n' + ($('Error Trigger').item.json.workflow || {}).name + '\\n' + ((($('Error Trigger').item.json.execution || {}).error || {}).message || 'erro sem mensagem') }) }}",
+        "options": {}
+      },
+      "id": "avisar-falha",
+      "name": "Avisar falha",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "RADAR_EVO",
+          "name": "Evolution apikey"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Destino",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Destino": {
+      "main": [
+        [
+          {
+            "node": "Avisar falha",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Sao_Paulo"
+  }
+}

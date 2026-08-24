@@ -40,6 +40,20 @@ CREATE TABLE IF NOT EXISTS perfis_busca (
   ativo       BOOLEAN DEFAULT true
 );
 
+-- Configuracao lida em tempo de execucao pelo workflow do n8n.
+--
+-- O numero de destino mora AQUI, e nao no JSON do workflow, de proposito: o
+-- JSON e versionado em repositorio publico, e telefone pessoal em repo publico
+-- nao se rotaciona como uma chave — fica indexado para sempre.
+-- Preencher a mao, uma vez, e nunca versionar o valor:
+--
+--   INSERT INTO config (chave, valor) VALUES ('whatsapp_destino', '55DDDNNNNNNNNN')
+--     ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor;
+CREATE TABLE IF NOT EXISTS config (
+  chave TEXT PRIMARY KEY,
+  valor TEXT NOT NULL
+);
+
 -- Filtro server-side da Gupy. city exige o acento: sem ele a API devolve zero.
 INSERT INTO perfis_busca (querystring) VALUES
   ('type=vacancy_type_internship&isRemoteWork=true'),
