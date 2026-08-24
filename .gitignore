@@ -17,3 +17,7 @@ venv/
 # Sistema
 .DS_Store
 Thumbs.db
+
+# Documentos de trabalho com contexto pessoal: ficam no disco, fora do git
+*.local.md
+CLAUDE.md
