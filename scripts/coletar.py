@@ -128,9 +128,13 @@ def formatar_mensagem(vagas):
         local = vaga["workplace_type"] or "?"
         if vaga["cidade"]:
             local += " · " + vaga["cidade"]
-        linhas.append("*" + str(vaga["titulo"]) + "*")
+        # O WhatsApp so fecha o negrito com o * colado a caractere nao-branco.
+        # Titulo da Gupy as vezes vem com espaco no fim ("... DEFICIENCIA "),
+        # e sem o strip os dois asteriscos vazam como texto literal.
+        titulo = str(vaga["titulo"] or "").strip()
+        linhas.append(("*" + titulo + "*") if titulo else "(sem titulo)")
         linhas.append(str(vaga["empresa"]) + " · " + local
-                      + " · ha " + idade_legivel(vaga["idade"]))
+                      + " · há " + idade_legivel(vaga["idade"]))
         if vaga["prazo"]:
             linhas.append("prazo: " + str(vaga["prazo"]))
         linhas.append(str(vaga["url"]))
