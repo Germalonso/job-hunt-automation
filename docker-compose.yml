@@ -1,0 +1,100 @@
+# Stack autocontido do Radar de Vagas.
+#
+# Nomes de container e portas sao deliberadamente distintos dos do
+# projeto-engajamento, para que os dois possam ficar de pe ao mesmo tempo
+# sem disputar porta nem nome. Quem clona o repositorio sobe so isto:
+#
+#   cp .env.example .env   (preencher as senhas)
+#   docker compose up -d
+#
+# Em desenvolvimento nesta maquina o radar aponta para o Postgres e a
+# Evolution do projeto-engajamento, que ja estao configurados. As variaveis
+# do .env decidem qual dos dois e usado — o codigo nao sabe a diferenca.
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: radar-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${RADAR_PGUSER:-radar}
+      POSTGRES_PASSWORD: ${RADAR_PGPASSWORD:?defina RADAR_PGPASSWORD no .env}
+      POSTGRES_DB: postgres
+    ports:
+      # 5432 e 5433 costumam estar ocupados por outros stacks nesta maquina.
+      - "${RADAR_PGPORT:-5434}:5432"
+    volumes:
+      - radar_postgres_data:/var/lib/postgresql/data
+      # Roda uma unica vez, na criacao do volume. Por isso o CREATE DATABASE
+      # e o CREATE TABLE estao em arquivos separados e numerados: juntos, as
+      # tabelas caem no database errado.
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RADAR_PGUSER:-radar} -d job_hunt_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: radar-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - radar_redis_data:/data
+
+  evolution-api:
+    # Versao validada em 24/08/2026. Body de envio: {number, text}.
+    # A v1 usava textMessage aninhado — nao troque de major sem ajustar o coletor.
+    image: evoapicloud/evolution-api:v2.3.7
+    container_name: radar-evolution
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      AUTHENTICATION_API_KEY: ${EVOLUTION_APIKEY:?defina EVOLUTION_APIKEY no .env}
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://${RADAR_PGUSER:-radar}:${RADAR_PGPASSWORD}@postgres:5432/evolution
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379
+      CACHE_REDIS_PREFIX_KEY: radar
+      CONFIG_SESSION_PHONE_VERSION: "2.3000.1045889064"
+    ports:
+      - "${RADAR_EVOLUTION_PORT:-8081}:8080"
+    volumes:
+      - radar_evolution_instances:/evolution/instances
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: radar-n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${RADAR_PGUSER:-radar}
+      DB_POSTGRESDB_PASSWORD: ${RADAR_PGPASSWORD}
+      GENERIC_TIMEZONE: America/Sao_Paulo
+      TZ: America/Sao_Paulo
+      # O radar chama a Evolution pelo nome do servico, dentro da rede do compose.
+      # De fora, use RADAR_EVOLUTION_PORT.
+      N8N_SECURE_COOKIE: "false"
+    ports:
+      - "${RADAR_N8N_PORT:-5679}:5678"
+    volumes:
+      - radar_n8n_data:/home/node/.n8n
+
+volumes:
+  radar_postgres_data:
+  radar_redis_data:
+  radar_evolution_instances:
+  radar_n8n_data:

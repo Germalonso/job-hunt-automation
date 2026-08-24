@@ -88,6 +88,35 @@ header literal em texto puro.
 A coluna `status` existe no schema e não é usada. Ela é o gancho da fase de CRM, e
 está documentada como tal em vez de removida.
 
+## Como rodar
+
+O repositorio e autocontido: o `docker-compose.yml` sobe Postgres, Redis, Evolution
+e n8n com nomes e portas proprios, escolhidos para nao colidir com outros stacks na
+mesma maquina.
+
+```bash
+cp .env.example .env      # preencher RADAR_PGPASSWORD e EVOLUTION_APIKEY
+docker compose up -d
+py -3.12 scripts/coletar.py --dry-run
+```
+
+O schema e criado sozinho na primeira subida, pelo `db/` montado em
+`docker-entrypoint-initdb.d`. Os dois arquivos SQL sao separados de proposito:
+`CREATE DATABASE` e `CREATE TABLE` no mesmo script criam as tabelas no database
+errado.
+
+| Modo | Efeito |
+|---|---|
+| `--dry-run` | Coleta e imprime no terminal. Nao grava, nao envia |
+| `--backfill` | Grava o estoque atual ja marcado como notificado, para o primeiro ciclo nao disparar tudo de uma vez |
+| `--notify` | Coleta, grava, e envia no WhatsApp o que ainda nao foi entregue |
+| `--test-notify` | Manda uma mensagem sintetica: testa so a entrega |
+| `--test-pipeline` | Insere vaga sintetica, notifica e limpa: prova o caminho banco -> WhatsApp inteiro |
+
+O coletor fala com o Postgres por `docker exec`, nao por TCP, porque no ambiente
+onde ele foi construido o banco reaproveitado nao publica porta no host. O container
+alvo vem do `.env`, entao o mesmo codigo serve aos dois casos.
+
 ## Stack
 
 `n8n` · `PostgreSQL 15` · `Evolution API` (WhatsApp) · `Python 3.12` · `Docker`
@@ -103,7 +132,7 @@ pré-requisitos verificados e a definição de pronto.
 ```
 [x] Etapa 0 — coleta e exibição no terminal
 [x] Etapa 1 — entrega no WhatsApp
-[ ] Etapa 2 — persistência e deduplicação
+[x] Etapa 2 — persistência e deduplicação
 [ ] Etapa 3 — orquestração autônoma no n8n
 ```
 

@@ -9,9 +9,12 @@ Requer py -3.12. O python do PATH (msys2) falha com SSLCertVerificationError.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import unicodedata
@@ -55,6 +58,167 @@ INTERNSHIP = "vacancy_type_internship"
 # 30 vagas de uma vez significa que algo quebrou no filtro, nao que o dia foi bom.
 VAGAS_POR_MENSAGEM = 10
 MAX_MENSAGENS = 3
+
+
+COLUNAS = ("fonte", "id_externo", "titulo", "empresa", "url", "tipo",
+           "workplace_type", "cidade", "remoto", "publicada_em", "prazo",
+           "score", "motivo", "notificada_em", "status")
+
+
+def config_postgres():
+    carregar_env()
+    return (os.environ.get("PGCONTAINER", "radar-postgres"),
+            os.environ.get("PGUSER", "radar"),
+            os.environ.get("PGDATABASE", "job_hunt_db"))
+
+
+def psql(script, entrada_extra=""):
+    """Roda psql dentro do container: nao ha psql no host, e o Postgres do
+    projeto-engajamento nao publica porta. O container vem do .env, entao o
+    mesmo codigo serve ao stack proprio (radar-postgres)."""
+    container, usuario, database = config_postgres()
+    comando = ["docker", "exec", "-i", container, "psql", "-U", usuario,
+               "-d", database, "-v", "ON_ERROR_STOP=1", "-q", "--no-align",
+               "--tuples-only", "--field-separator=\t"]
+    processo = subprocess.run(comando, input=(script + entrada_extra),
+                              capture_output=True, text=True, encoding="utf-8")
+    if processo.returncode != 0:
+        raise RuntimeError("psql falhou: " + (processo.stderr or "").strip()[:400])
+    return processo.stdout
+
+
+def _csv_das_vagas(vagas, notificada_agora):
+    """CSV e o caminho seguro: titulo com aspas ou virgula nao vira SQL."""
+    buffer = io.StringIO()
+    escritor = csv.writer(buffer, lineterminator="\n")
+    carimbo = datetime.now(timezone.utc).isoformat() if notificada_agora else ""
+    for vaga in vagas:
+        remoto = vaga["workplace_type"] == "remote" or bool(vaga.get("remoto"))
+        escritor.writerow([
+            "gupy",
+            vaga["id_externo"],
+            (vaga["titulo"] or "").strip(),
+            vaga["empresa"] or "",
+            vaga["url"] or "",
+            vaga["tipo"] or "",
+            vaga["workplace_type"] or "",
+            vaga["cidade"] or "",
+            "true" if remoto else "false",
+            vaga["publicada_em"].isoformat(),
+            vaga["prazo"] or "",
+            vaga["score"],
+            vaga["motivo"],
+            carimbo,
+            "backfill" if notificada_agora else "nova",
+        ])
+    return buffer.getvalue()
+
+
+def gravar(vagas, notificada_agora=False):
+    """INSERT ... ON CONFLICT DO NOTHING. Devolve quantas linhas entraram.
+
+    Sem RETURNING de proposito: quem decide o que notificar e o SELECT por
+    notificada_em IS NULL, nao o resultado do INSERT. Assim uma falha de
+    entrega no WhatsApp devolve a vaga ao ciclo seguinte."""
+    if not vagas:
+        return 0
+    lista = ", ".join(COLUNAS)
+    script = (
+        "BEGIN;\n"
+        "CREATE TEMP TABLE _entrada (LIKE vagas INCLUDING DEFAULTS)"
+        " ON COMMIT DROP;\n"
+        "\\copy _entrada (" + lista + ") FROM STDIN WITH (FORMAT csv, NULL '')\n"
+    )
+    fim = ("\\.\n"
+           "INSERT INTO vagas (" + lista + ")\n"
+           "SELECT " + lista + " FROM _entrada\n"
+           "ON CONFLICT (fonte, id_externo) DO NOTHING;\n"
+           "COMMIT;\n")
+    antes = contar()
+    psql(script + _csv_das_vagas(vagas, notificada_agora) + fim)
+    return contar() - antes
+
+
+def contar():
+    return int((psql("SELECT count(*) FROM vagas;") or "0").strip() or 0)
+
+
+def pendentes(limite=VAGAS_POR_MENSAGEM * MAX_MENSAGENS):
+    """O que ainda nao foi entregue, dentro da janela de 72h."""
+    saida = psql(
+        "SELECT fonte, id_externo, titulo, empresa, url, workplace_type, cidade,"
+        " publicada_em, prazo, score, motivo FROM vagas"
+        " WHERE notificada_em IS NULL"
+        "   AND publicada_em > now() - interval '72 hours'"
+        " ORDER BY score DESC, publicada_em DESC LIMIT " + str(int(limite)) + ";")
+    agora = datetime.now(timezone.utc)
+    linhas = []
+    for linha in saida.splitlines():
+        if not linha.strip():
+            continue
+        campo = linha.split("\t")
+        if len(campo) < 11:
+            continue
+        publicada = parse_publicada(campo[7].replace(" ", "T", 1))
+        linhas.append({
+            "fonte": campo[0], "id_externo": campo[1], "titulo": campo[2],
+            "empresa": campo[3], "url": campo[4], "workplace_type": campo[5],
+            "cidade": campo[6] or None, "publicada_em": publicada,
+            "prazo": campo[8] or None, "score": int(campo[9] or 0),
+            "motivo": campo[10],
+            "idade": (agora - publicada) if publicada else timedelta(0),
+        })
+    return linhas
+
+
+def marcar_notificadas(vagas):
+    """UPDATE com WHERE obrigatorio: sem ele, marca a tabela inteira."""
+    if not vagas:
+        return 0
+    valores = ", ".join(
+        "('" + v["fonte"].replace("'", "''") + "','"
+        + re.sub(r"[^0-9A-Za-z_-]", "", str(v["id_externo"])) + "')"
+        for v in vagas)
+    psql("UPDATE vagas SET notificada_em = now(), status = 'notificada'"
+         " WHERE (fonte, id_externo) IN (" + valores + ");")
+    return len(vagas)
+
+
+def test_pipeline():
+    """Prova o caminho inteiro — banco, filtro de pendentes, entrega e carimbo —
+    sem depender de a Gupy ter publicado vaga nova. Reversivel: a vaga sintetica
+    usa fonte='teste' e e removida no fim, inclusive se o envio falhar."""
+    psql("DELETE FROM vagas WHERE fonte = 'teste';")
+    psql("INSERT INTO vagas (fonte, id_externo, titulo, empresa, url, tipo,"
+         " workplace_type, remoto, publicada_em, score, motivo, status)"
+         " VALUES ('teste', 'TESTE', 'Vaga sintetica do teste de pipeline',"
+         " 'Radar de Vagas', 'https://example.invalid/teste',"
+         " 'vacancy_type_internship', 'remote', true, now(), 100,"
+         " 'teste automatizado', 'nova');")
+    try:
+        fila = [v for v in pendentes() if v["fonte"] == "teste"]
+        if not fila:
+            print("FALHOU: a vaga sintetica nao apareceu em pendentes()",
+                  file=sys.stderr)
+            return 1
+
+        entregues = notificar(fila)
+        if not entregues:
+            print("FALHOU: nada foi entregue", file=sys.stderr)
+            return 1
+
+        marcar_notificadas(entregues)
+        restante = psql("SELECT count(*) FROM vagas WHERE fonte = 'teste'"
+                        " AND notificada_em IS NULL;").strip()
+        if restante != "0":
+            print("FALHOU: a vaga sintetica seguiu pendente apos o envio",
+                  file=sys.stderr)
+            return 1
+        print("pipeline ok: gravou, listou como pendente, entregou e carimbou.")
+        return 0
+    finally:
+        psql("DELETE FROM vagas WHERE fonte = 'teste';")
+        print("vaga sintetica removida.")
 
 
 def carregar_env(caminho=None):
@@ -143,20 +307,28 @@ def formatar_mensagem(vagas):
 
 
 def notificar(vagas):
-    """Fatia em mensagens e envia. Devolve quantas vagas foram efetivamente enviadas."""
+    """Fatia em mensagens e envia. Devolve a lista das vagas efetivamente
+    entregues — so essas podem ser marcadas como notificadas. Se a terceira
+    mensagem falha, as duas primeiras continuam marcadas e a falha nao
+    reenvia o que ja chegou."""
     if not vagas:
-        return 0
+        return []
     lotes = [vagas[i:i + VAGAS_POR_MENSAGEM]
              for i in range(0, len(vagas), VAGAS_POR_MENSAGEM)][:MAX_MENSAGENS]
-    enviadas = 0
+    entregues = []
     for indice, lote in enumerate(lotes, start=1):
-        enviar_whatsapp(formatar_mensagem(lote))
-        enviadas += len(lote)
+        try:
+            enviar_whatsapp(formatar_mensagem(lote))
+        except RuntimeError as erro:
+            print("  ! mensagem " + str(indice) + " falhou: " + str(erro),
+                  file=sys.stderr)
+            break
+        entregues.extend(lote)
         print("  enviada mensagem " + str(indice) + "/" + str(len(lotes))
               + " com " + str(len(lote)) + " vaga(s)")
         if indice < len(lotes):
             time.sleep(2)
-    return enviadas
+    return entregues
 
 
 def normalizar(s):
@@ -326,9 +498,22 @@ def main():
                         help="coleta e imprime no terminal, sem gravar nem notificar")
     parser.add_argument("--notify", action="store_true",
                         help="coleta e envia as vagas aprovadas no WhatsApp")
+    parser.add_argument("--backfill", action="store_true",
+                        help="grava o estoque atual como ja notificado, para o "
+                             "primeiro ciclo do n8n nao disparar tudo de uma vez")
     parser.add_argument("--test-notify", action="store_true",
                         help="envia uma mensagem sintetica para validar a entrega")
+    parser.add_argument("--test-pipeline", action="store_true",
+                        help="insere vaga sintetica, notifica e limpa; prova o "
+                             "caminho banco -> WhatsApp de ponta a ponta")
     args = parser.parse_args()
+
+    if args.test_pipeline:
+        try:
+            return test_pipeline()
+        except RuntimeError as erro:
+            print("FALHOU: " + str(erro), file=sys.stderr)
+            return 1
 
     if args.test_notify:
         carimbo = datetime.now().strftime("%d/%m %H:%M")
@@ -341,38 +526,53 @@ def main():
         print("mensagem de teste enviada.")
         return 0
 
-    if not (args.dry_run or args.notify):
+    if not (args.dry_run or args.notify or args.backfill):
         parser.print_help()
-        print("\nEscolha um modo: --dry-run, --notify ou --test-notify.",
+        print("\nEscolha um modo: --dry-run, --notify, --backfill ou --test-notify.",
               file=sys.stderr)
         return 2
 
-    modo = "notify" if args.notify else "dry-run"
+    modo = "backfill" if args.backfill else ("notify" if args.notify else "dry-run")
     print("Radar de Vagas — coleta (" + modo + ")\n")
 
-    # Validar credencial ANTES de gastar 4 requests na Gupy.
-    if args.notify:
-        try:
+    # Validar credencial e banco ANTES de gastar 4 requests na Gupy.
+    try:
+        if args.notify:
             config_evolution()
-        except RuntimeError as erro:
-            print("FALHOU: " + str(erro), file=sys.stderr)
-            return 1
+        if args.notify or args.backfill:
+            contar()
+    except RuntimeError as erro:
+        print("FALHOU: " + str(erro), file=sys.stderr)
+        return 1
 
     vagas, total, rejeicoes = coletar(verboso=True)
     imprimir(vagas, total, rejeicoes)
 
-    if args.notify:
-        if not vagas:
-            print("nada a notificar.")
-            return 0
+    if args.dry_run:
+        return 0
+
+    if args.backfill:
+        # Marca tudo como ja notificado: sem isto, o primeiro ciclo do n8n
+        # dispara o estoque inteiro de uma vez.
+        novas = gravar(vagas, notificada_agora=True)
         print()
-        try:
-            enviadas = notificar(vagas)
-        except RuntimeError as erro:
-            print("FALHOU no envio: " + str(erro), file=sys.stderr)
-            return 1
-        print(str(enviadas) + " vaga(s) notificada(s).")
-    return 0
+        print(str(novas) + " vaga(s) gravada(s) como backfill · "
+              + str(contar()) + " no banco.")
+        return 0
+
+    novas = gravar(vagas)
+    print()
+    print(str(novas) + " vaga(s) nova(s) gravada(s) · " + str(contar()) + " no banco.")
+
+    fila = pendentes()
+    if not fila:
+        print("nada pendente para notificar.")
+        return 0
+
+    entregues = notificar(fila)
+    marcar_notificadas(entregues)
+    print(str(len(entregues)) + " de " + str(len(fila)) + " pendente(s) notificada(s).")
+    return 0 if len(entregues) == len(fila) else 1
 
 
 if __name__ == "__main__":
