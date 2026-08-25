@@ -21,3 +21,7 @@ Thumbs.db
 # Documentos de trabalho com contexto pessoal: ficam no disco, fora do git
 *.local.md
 CLAUDE.md
+
+# Curriculo base e saidas geradas: dado pessoal, nunca versionar
+cv-base.md
+saida/
